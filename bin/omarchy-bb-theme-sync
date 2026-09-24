@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM=omarchy-bb-theme-sync
+THEME_ID=omarchy-sync
+SCRIPT_PATH=$0
+if command -v readlink >/dev/null 2>&1; then
+  resolved_script_path=$(readlink -f -- "$SCRIPT_PATH" 2>/dev/null || true)
+  [ -n "${resolved_script_path:-}" ] && SCRIPT_PATH=$resolved_script_path
+fi
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+
+# Leave this empty by default so resolve_bb_bin can distinguish an explicit
+# override from a regular `bb` command on PATH.
+BB_BIN=${BB_BIN:-}
+BB_CLI=${BB_CLI:-}
+# Packaged BB installs expose the CLI inside the extracted app bundle. The
+# bundle path is versioned, so discover it on every invocation instead of
+# retaining a path that becomes stale after an update.
+BB_APP_DATA_ROOT=${OMARCHY_BB_APP_DATA_ROOT:-${XDG_DATA_HOME:-${HOME:?}/.local/share}}
+BB_APPIMAGE_TEMP_ROOT=${OMARCHY_BB_APPIMAGE_TMP_ROOT:-/tmp}
+BB_CLI_RELATIVE_PATH=bb-*/resources/app.asar.unpacked/node_modules/bb-app/host-daemon/dist/bb
+USER_THEME_ROOT=${OMARCHY_USER_THEME_ROOT:-${HOME:?}/.config/omarchy/themes}
+STOCK_THEME_ROOT=${OMARCHY_STOCK_THEME_ROOT:-/usr/share/omarchy/themes}
+
+die() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  omarchy-bb-theme-sync [options] [theme-slug]
+  omarchy-bb-theme-sync sync [options] [theme-slug]
+  omarchy-bb-theme-sync status
+  omarchy-bb-theme-sync uninstall [--remove-theme]
+
+Sync the effective Omarchy colors.toml into the stable BB custom theme
+"omarchy-sync", then activate it live. With no slug, the current Omarchy
+theme is determined with `omarchy theme current`.
+
+Options:
+  --dry-run       Generate CSS to stdout; do not write or activate anything.
+  --no-activate   Write the CSS but do not run `bb theme set`.
+  --help          Show this help.
+
+Environment overrides (useful for tests or a non-default installation):
+  BB_BIN                    BB executable (default: bb)
+  BB_CLI                    Bundled BB CLI path supplied by the desktop app
+  OMARCHY_USER_THEME_ROOT  User theme root (default: ~/.config/omarchy/themes)
+  OMARCHY_STOCK_THEME_ROOT Stock theme root (default: /usr/share/omarchy/themes)
+  OMARCHY_BB_THEME_DIR     Override `bb theme dir` (normally do not set this)
+  OMARCHY_BB_APP_DATA_ROOT Search root for extracted BB app bundles
+EOF
+}
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+resolve_bb_bin() {
+  local candidate resolved
+  if [ -n "$BB_BIN" ]; then
+    if [ -x "$BB_BIN" ]; then printf '%s' "$BB_BIN"; return; fi
+    if resolved=$(command -v "$BB_BIN" 2>/dev/null); then printf '%s' "$resolved"; return; fi
+    die "BB executable specified by BB_BIN is unavailable: $BB_BIN"
+  fi
+
+  # BB's packaged launcher exports the exact CLI path when it launches an
+  # agent. Prefer it when available, but treat a stale value after an update as
+  # a hint and continue with the other discovery paths.
+  if [ -n "$BB_CLI" ]; then
+    if [ -x "$BB_CLI" ]; then printf '%s' "$BB_CLI"; return; fi
+    if resolved=$(command -v "$BB_CLI" 2>/dev/null); then printf '%s' "$resolved"; return; fi
+  fi
+
+  if resolved=$(command -v bb 2>/dev/null); then printf '%s' "$resolved"; return; fi
+
+  # A downloaded AppImage is extracted into ~/.local/share/bb-<version> by the
+  # packaged launcher. This path survives while the app is installed, but the
+  # version directory changes on update, so keep the glob versioned.
+  for candidate in "$BB_APP_DATA_ROOT"/$BB_CLI_RELATIVE_PATH; do
+    [ -x "$candidate" ] || continue
+    printf '%s' "$candidate"
+    return
+  done
+
+  # An AppImage mount only exists while the BB desktop app is running. Do not
+  # retain this ephemeral path anywhere; discover it for each invocation.
+  for candidate in "$BB_APPIMAGE_TEMP_ROOT"/.mount_bb-*/resources/app.asar.unpacked/node_modules/bb-app/host-daemon/dist/bb; do
+    [ -x "$candidate" ] || continue
+    printf '%s' "$candidate"
+    return
+  done
+
+  die "BB executable not found. Install bb on PATH, set BB_BIN, or keep the BB desktop app installed/open before syncing."
+}
+
+hex_is_valid() {
+  case ${1:-} in
+    \#[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Read the small, top-level scalar dialect used by Omarchy colors.toml. This
+# intentionally avoids evaluating TOML and avoids adding a parser dependency.
+toml_value() {
+  local key=$1 file=$2 value
+  value=$(awk -v wanted="$key" '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0
+      if (line !~ "^[[:space:]]*" wanted "[[:space:]]*=") next
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      if (line ~ /^"/) {
+        sub(/^"/, "", line)
+        sub(/".*$/, "", line)
+      } else {
+        sub(/[[:space:]]+#.*$/, "", line)
+        sub(/[[:space:]]+$/, "", line)
+      }
+      print line
+      exit
+    }
+  ' "$file")
+  printf '%s' "$value"
+}
+
+color_from() {
+  local key=$1 file=$2 fallback=${3:-} value
+  value=$(toml_value "$key" "$file")
+  if hex_is_valid "$value"; then
+    printf '%s' "$value"
+  elif [ -n "$fallback" ]; then
+    printf '%s' "$fallback"
+  else
+    die "colors.toml has no valid hex value for '$key': $file"
+  fi
+}
+
+mode_from() {
+  local file=$1 mode
+  mode=$(toml_value mode "$file" | tr '[:upper:]' '[:lower:]')
+  case $mode in dark|light) printf '%s' "$mode" ;; *) printf '%s' auto ;; esac
+}
+
+slugify() {
+  printf '%s\n' "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9][^a-z0-9]*/-/g; s/^-*//; s/-*$//'
+}
+
+determine_slug() {
+  local current
+  if [ -n "${OMARCHY_THEME_SLUG:-}" ]; then printf '%s' "$OMARCHY_THEME_SLUG"; return; fi
+  command_exists omarchy || die "no theme slug supplied and 'omarchy' is not installed"
+  current=$(omarchy theme current 2>/dev/null) || die "could not determine the current Omarchy theme"
+  current=${current%%$'\n'*}
+  [ -n "$current" ] || die "current Omarchy theme name is empty"
+  slugify "$current"
+}
+
+resolve_colors_file() {
+  local slug=$1 user_file stock_file
+  case $slug in
+    ''|.|..|*[!a-zA-Z0-9._-]*) die "invalid theme slug: '$slug'" ;;
+  esac
+  user_file=$USER_THEME_ROOT/$slug/colors.toml
+  stock_file=$STOCK_THEME_ROOT/$slug/colors.toml
+  if [ -f "$user_file" ]; then printf '%s' "$user_file"
+  elif [ -f "$stock_file" ]; then printf '%s' "$stock_file"
+  else die "no colors.toml found for '$slug' (checked user theme, then stock theme)"; fi
+}
+
+hex_component() { printf '%d' "$((16#$1))"; }
+hex_from_rgb() { printf '#%02x%02x%02x' "$1" "$2" "$3"; }
+
+mix_hex() {
+  local first=$1 second=$2 amount=$3 r1 g1 b1 r2 g2 b2
+  r1=$(hex_component "${first:1:2}"); g1=$(hex_component "${first:3:2}"); b1=$(hex_component "${first:5:2}")
+  r2=$(hex_component "${second:1:2}"); g2=$(hex_component "${second:3:2}"); b2=$(hex_component "${second:5:2}")
+  hex_from_rgb "$(( (r1 * (100 - amount) + r2 * amount + 50) / 100 ))" \
+    "$(( (g1 * (100 - amount) + g2 * amount + 50) / 100 ))" \
+    "$(( (b1 * (100 - amount) + b2 * amount + 50) / 100 ))"
+}
+
+yiq() {
+  local color=$1 r g b
+  r=$(hex_component "${color:1:2}"); g=$(hex_component "${color:3:2}"); b=$(hex_component "${color:5:2}")
+  printf '%d' "$((299 * r + 587 * g + 114 * b))"
+}
+
+best_foreground() { if [ "$(yiq "$1")" -ge 140000 ]; then printf '#111111'; else printf '#ffffff'; fi; }
+
+text_variant() {
+  local color=$1 canvas=$2
+  if [ "$(yiq "$canvas")" -ge 140000 ]; then mix_hex "$color" '#000000' 38
+  else mix_hex "$color" '#ffffff' 22; fi
+}
+
+emit_block() {
+  local selector=$1 canvas=$2 ink=$3 primary=$4 destructive=$5 warning=$6 attention=$7 success=$8 \
+    diff_added=$9 diff_removed=${10} pr_merged=${11} file_accent=${12} ansi0=${13} ansi1=${14} ansi2=${15} ansi3=${16} \
+    ansi4=${17} ansi5=${18} ansi6=${19} ansi7=${20} ansi8=${21} ansi9=${22} ansi10=${23} ansi11=${24} ansi12=${25} \
+    ansi13=${26} ansi14=${27} ansi15=${28} selection=${29} muted=${30} recessed=${31} raised=${32} ansi0_fg ansi1_fg ansi2_fg ansi3_fg ansi4_fg ansi5_fg ansi6_fg ansi7_fg \
+    ansi8_fg ansi9_fg ansi10_fg ansi11_fg ansi12_fg ansi13_fg ansi14_fg ansi15_fg
+  ansi0_fg=$(best_foreground "$ansi0"); ansi1_fg=$(best_foreground "$ansi1"); ansi2_fg=$(best_foreground "$ansi2"); ansi3_fg=$(best_foreground "$ansi3")
+  ansi4_fg=$(best_foreground "$ansi4"); ansi5_fg=$(best_foreground "$ansi5"); ansi6_fg=$(best_foreground "$ansi6"); ansi7_fg=$(best_foreground "$ansi7")
+  ansi8_fg=$(best_foreground "$ansi8"); ansi9_fg=$(best_foreground "$ansi9"); ansi10_fg=$(best_foreground "$ansi10"); ansi11_fg=$(best_foreground "$ansi11")
+  ansi12_fg=$(best_foreground "$ansi12"); ansi13_fg=$(best_foreground "$ansi13"); ansi14_fg=$(best_foreground "$ansi14"); ansi15_fg=$(best_foreground "$ansi15")
+  cat <<EOF
+$selector {
+  --canvas: $canvas;
+  --ink: $ink;
+  --background: var(--canvas);
+  --foreground: var(--ink);
+  --card: var(--canvas);
+  --popover: var(--canvas);
+  --secondary: color-mix(in oklch, var(--ink) 8%, var(--canvas));
+  --accent: $selection;
+  --muted: $muted;
+  --border: color-mix(in oklch, var(--ink) 14%, var(--canvas));
+  --border-hairline: color-mix(in oklch, var(--ink) 15%, var(--canvas));
+  --border-seam: color-mix(in oklch, var(--ink) 10%, var(--canvas));
+  --border-seam-vertical: var(--border-seam);
+  --input: color-mix(in oklch, var(--ink) 30%, var(--canvas));
+  --surface-recessed: $recessed;
+  --surface-raised: $raised;
+  --surface-selected: $selection;
+  --surface-selected-border: $primary;
+  --sidebar: var(--canvas);
+  --sidebar-foreground: var(--ink);
+  --sidebar-accent: var(--accent);
+  --sidebar-border: var(--border);
+  --primary: $primary;
+  --primary-foreground: $(best_foreground "$primary");
+  --ring: var(--primary);
+  --sidebar-ring: var(--primary);
+  --file-accent: $file_accent;
+  --muted-foreground: color-mix(in oklch, var(--ink) 70%, var(--canvas));
+  --subtle-foreground: color-mix(in oklch, var(--ink) 58%, var(--canvas));
+  --readback-foreground: color-mix(in oklch, var(--ink) 64%, var(--canvas));
+  --destructive: $destructive;
+  --destructive-foreground: $(best_foreground "$destructive");
+  --destructive-text: $(text_variant "$destructive" "$canvas");
+  --warning: $warning;
+  --warning-text: $(text_variant "$warning" "$canvas");
+  --attention: $attention;
+  --success: $success;
+  --diff-added: $diff_added;
+  --diff-removed: $diff_removed;
+  --pr-merged: $pr_merged;
+EOF
+  local i color fg
+  for ((i = 0; i <= 15; i++)); do
+    eval "color=\${ansi${i}}"; eval "fg=\${ansi${i}_fg}"
+    printf '  --ansi-%s: %s;\n' "$i" "$color"
+    printf '  --ansi-bg-fg-%s: %s;\n' "$i" "$fg"
+  done
+  printf '}\n'
+}
+
+build_css() {
+  local slug=$1 file=$2 mode=$3
+  local accent selection muted background dark_background darker_background lighter_background
+  local foreground dark_foreground light_foreground bright_foreground
+  local red yellow orange green cyan blue magenta brown bright_red bright_yellow bright_green bright_cyan bright_blue bright_magenta
+  accent=$(color_from accent "$file" '#6688cc'); selection=$(color_from selection "$file" "$accent"); muted=$(color_from muted "$file" "$selection")
+  background=$(color_from background "$file" '#202020'); dark_background=$(color_from dark_background "$file" "$background")
+  darker_background=$(color_from darker_background "$file" "$dark_background"); lighter_background=$(color_from lighter_background "$file" "$background")
+  foreground=$(color_from foreground "$file" '#d0d0d0'); dark_foreground=$(color_from dark_foreground "$file" "$foreground")
+  light_foreground=$(color_from light_foreground "$file" "$foreground"); bright_foreground=$(color_from bright_foreground "$file" "$foreground")
+  red=$(color_from red "$file" '#d35f5f'); yellow=$(color_from yellow "$file" '#d8a657'); orange=$(color_from orange "$file" "$yellow")
+  green=$(color_from green "$file" '#a9b665'); cyan=$(color_from cyan "$file" "$foreground"); blue=$(color_from blue "$file" "$accent")
+  magenta=$(color_from magenta "$file" "$red"); brown=$(color_from brown "$file" "$red")
+  bright_red=$(color_from bright_red "$file" "$red"); bright_yellow=$(color_from bright_yellow "$file" "$yellow"); bright_green=$(color_from bright_green "$file" "$green")
+  bright_cyan=$(color_from bright_cyan "$file" "$cyan"); bright_blue=$(color_from bright_blue "$file" "$blue"); bright_magenta=$(color_from bright_magenta "$file" "$magenta")
+
+  local light_canvas light_ink dark_canvas dark_ink
+  if [ "$mode" = dark ]; then
+    dark_canvas=$background; dark_ink=$foreground; light_canvas=$(mix_hex "$background" '#ffffff' 92); light_ink=$(mix_hex "$foreground" '#000000' 88)
+  elif [ "$mode" = light ]; then
+    light_canvas=$background; light_ink=$foreground; dark_canvas=$(mix_hex "$background" '#000000' 92); dark_ink=$(mix_hex "$foreground" '#ffffff' 88)
+  elif [ "$(yiq "$background")" -lt 140000 ]; then
+    dark_canvas=$background; dark_ink=$foreground; light_canvas=$(mix_hex "$background" '#ffffff' 92); light_ink=$(mix_hex "$foreground" '#000000' 88)
+  else
+    light_canvas=$background; light_ink=$foreground; dark_canvas=$(mix_hex "$background" '#000000' 92); dark_ink=$(mix_hex "$foreground" '#ffffff' 88)
+  fi
+
+  local light_red light_yellow light_orange light_green light_cyan light_blue light_magenta light_brown
+  local dark_red dark_yellow dark_orange dark_green dark_cyan dark_blue dark_magenta dark_brown
+  light_red=$(text_variant "$red" "$light_canvas"); light_yellow=$(text_variant "$yellow" "$light_canvas"); light_orange=$(text_variant "$orange" "$light_canvas"); light_green=$(text_variant "$green" "$light_canvas")
+  light_cyan=$(text_variant "$cyan" "$light_canvas"); light_blue=$(text_variant "$blue" "$light_canvas"); light_magenta=$(text_variant "$magenta" "$light_canvas"); light_brown=$(text_variant "$brown" "$light_canvas")
+  dark_red=$(text_variant "$red" "$dark_canvas"); dark_yellow=$(text_variant "$yellow" "$dark_canvas"); dark_orange=$(text_variant "$orange" "$dark_canvas"); dark_green=$(text_variant "$green" "$dark_canvas")
+  dark_cyan=$(text_variant "$cyan" "$dark_canvas"); dark_blue=$(text_variant "$blue" "$dark_canvas"); dark_magenta=$(text_variant "$magenta" "$dark_canvas"); dark_brown=$(text_variant "$brown" "$dark_canvas")
+
+  local light_ansi0=$darker_background light_ansi1=$light_red light_ansi2=$light_green light_ansi3=$light_yellow light_ansi4=$light_blue light_ansi5=$light_magenta light_ansi6=$light_cyan light_ansi7=$light_ink
+  local light_ansi8=$dark_background light_ansi9=$bright_red light_ansi10=$bright_green light_ansi11=$bright_yellow light_ansi12=$bright_blue light_ansi13=$bright_magenta light_ansi14=$bright_cyan light_ansi15=$bright_foreground
+  local dark_ansi0=$darker_background dark_ansi1=$red dark_ansi2=$green dark_ansi3=$yellow dark_ansi4=$blue dark_ansi5=$magenta dark_ansi6=$cyan dark_ansi7=$dark_ink
+  local dark_ansi8=$dark_background dark_ansi9=$bright_red dark_ansi10=$bright_green dark_ansi11=$bright_yellow dark_ansi12=$bright_blue dark_ansi13=$bright_magenta dark_ansi14=$bright_cyan dark_ansi15=$bright_foreground
+
+  cat <<EOF
+/* Generated by $PROGRAM for Omarchy theme '$slug'. Do not edit; re-run sync. */
+/* Omarchy mode: $mode. The generated light/dark layers are BB mode-aware. */
+EOF
+  emit_block ':root, .light' "$light_canvas" "$light_ink" "$accent" "$light_red" "$light_yellow" "$light_orange" "$light_green" "$light_green" "$light_red" "$light_magenta" "$accent" \
+    "$light_ansi0" "$light_ansi1" "$light_ansi2" "$light_ansi3" "$light_ansi4" "$light_ansi5" "$light_ansi6" "$light_ansi7" "$light_ansi8" "$light_ansi9" "$light_ansi10" "$light_ansi11" "$light_ansi12" "$light_ansi13" "$light_ansi14" "$light_ansi15" \
+    "$selection" "$muted" "$darker_background" "$lighter_background"
+  emit_block '.dark' "$dark_canvas" "$dark_ink" "$accent" "$dark_red" "$dark_yellow" "$dark_orange" "$dark_green" "$dark_green" "$dark_red" "$dark_magenta" "$accent" \
+    "$dark_ansi0" "$dark_ansi1" "$dark_ansi2" "$dark_ansi3" "$dark_ansi4" "$dark_ansi5" "$dark_ansi6" "$dark_ansi7" "$dark_ansi8" "$dark_ansi9" "$dark_ansi10" "$dark_ansi11" "$dark_ansi12" "$dark_ansi13" "$dark_ansi14" "$dark_ansi15" \
+    "$selection" "$muted" "$darker_background" "$lighter_background"
+}
+
+get_bb_theme_dir() {
+  if [ -n "${OMARCHY_BB_THEME_DIR:-}" ]; then printf '%s' "$OMARCHY_BB_THEME_DIR"
+  else
+    local bb_bin
+    bb_bin=$(resolve_bb_bin)
+    "$bb_bin" theme dir || die "BB did not report its custom theme directory"
+  fi
+}
+
+sync_theme() {
+  local slug=$1 dry_run=$2 no_activate=$3 file mode theme_dir target_dir temp_file
+  file=$(resolve_colors_file "$slug"); mode=$(mode_from "$file")
+  if [ "$dry_run" -eq 1 ]; then build_css "$slug" "$file" "$mode"; return; fi
+  theme_dir=$(get_bb_theme_dir); [ -n "$theme_dir" ] || die "BB theme directory is empty"
+  case $theme_dir in /*) ;; *) die "BB theme directory is not absolute: $theme_dir" ;; esac
+  target_dir=$theme_dir/$THEME_ID; mkdir -p "$target_dir"
+  temp_file=$(mktemp "$target_dir/.theme.css.XXXXXX") || die "could not create a temporary CSS file"
+  trap 'rm -f -- "$temp_file"' EXIT HUP INT TERM
+  build_css "$slug" "$file" "$mode" >"$temp_file"; chmod 0644 "$temp_file"; mv -f -- "$temp_file" "$target_dir/theme.css"
+  trap - EXIT HUP INT TERM
+  info "Wrote $target_dir/theme.css (source: $file)"
+  if [ "$no_activate" -eq 0 ]; then
+    local bb_bin
+    bb_bin=$(resolve_bb_bin)
+    "$bb_bin" theme set "$THEME_ID"
+    info "Activated BB theme '$THEME_ID'"
+  else info 'Activation skipped (--no-activate)'; fi
+}
+
+link_status() {
+  local path=$1 expected=$2 label=$3 actual
+  if [ -L "$path" ]; then actual=$(readlink "$path"); if [ "$actual" = "$expected" ]; then info "$label: installed ($path)"; else info "$label: different symlink ($path -> $actual)"; fi
+  elif [ -e "$path" ]; then info "$label: blocked by existing non-symlink ($path)"; else info "$label: not installed"; fi
+}
+
+status() {
+  local slug='' file='' theme_dir generated active bb_bin
+  info "Project: $PROJECT_ROOT"
+  link_status "${HOME:?}/.local/bin/$PROGRAM" "$PROJECT_ROOT/bin/$PROGRAM" 'Command'
+  link_status "${HOME:?}/.config/omarchy/hooks/theme-set.d/$PROGRAM" "$PROJECT_ROOT/hooks/theme-set.d/$PROGRAM" 'Theme hook'
+  if file=$(resolve_colors_file "$(determine_slug)" 2>/dev/null); then slug=$(basename "$(dirname "$file")"); info "Omarchy source: $file"; info "Omarchy slug: $slug"; else info 'Omarchy source: unavailable'; fi
+  if theme_dir=$(get_bb_theme_dir 2>/dev/null); then generated=$theme_dir/$THEME_ID/theme.css; info "BB theme directory: $theme_dir"; if [ -f "$generated" ]; then info "Generated theme: present ($generated)"; else info 'Generated theme: absent'; fi; else info 'BB theme directory: unavailable'; fi
+  if bb_bin=$(resolve_bb_bin 2>/dev/null) && active=$("$bb_bin" theme show 2>/dev/null); then info "BB active: ${active%%$'\n'*}"; else info 'BB active: unavailable'; fi
+}
+
+uninstall() {
+  local remove_theme=$1 command_link hook_link theme_dir generated active bb_bin
+  command_link=${HOME:?}/.local/bin/$PROGRAM; hook_link=${HOME:?}/.config/omarchy/hooks/theme-set.d/$PROGRAM
+  if [ -L "$command_link" ] && [ "$(readlink "$command_link")" = "$PROJECT_ROOT/bin/$PROGRAM" ]; then rm -f -- "$command_link"; info "Removed $command_link"; else info 'Left command link unchanged (not owned by this checkout)'; fi
+  if [ -L "$hook_link" ] && [ "$(readlink "$hook_link")" = "$PROJECT_ROOT/hooks/theme-set.d/$PROGRAM" ]; then rm -f -- "$hook_link"; info "Removed $hook_link"; else info 'Left hook link unchanged (not owned by this checkout)'; fi
+  if [ "$remove_theme" -eq 1 ]; then
+    theme_dir=$(get_bb_theme_dir); generated=$theme_dir/$THEME_ID/theme.css; [ -f "$generated" ] || { info 'Generated BB theme is already absent'; return; }
+    grep -q "Generated by $PROGRAM" "$generated" || die "refusing to remove unmarked BB theme: $generated"
+    bb_bin=$(resolve_bb_bin)
+    active=$("$bb_bin" theme show 2>/dev/null || true); case $active in *"($THEME_ID)"*) die "BB theme '$THEME_ID' is active; select another theme before removing it" ;; esac
+    rm -f -- "$generated"; rmdir "$theme_dir/$THEME_ID" 2>/dev/null || true; info "Removed generated BB theme $generated"
+  else info "Kept generated BB theme; use --remove-theme to remove only this project's marked theme"; fi
+}
+
+main() {
+  local slug='' dry_run=0 no_activate=0 remove_theme=0 arg
+  if [ "${1:-}" = status ]; then status; return; fi
+  if [ "${1:-}" = uninstall ]; then
+    shift
+    while [ "$#" -gt 0 ]; do case $1 in --remove-theme) remove_theme=1 ;; --help) usage; return ;; *) die "unknown uninstall option: $1" ;; esac; shift; done
+    uninstall "$remove_theme"; return
+  fi
+  if [ "${1:-}" = sync ]; then shift; fi
+  while [ "$#" -gt 0 ]; do
+    arg=$1
+    case $arg in --dry-run) dry_run=1 ;; --no-activate) no_activate=1 ;; --help|-h) usage; return ;; --*) die "unknown option: $arg" ;; '') ;; *) [ -z "$slug" ] || die 'only one theme slug may be supplied'; slug=$arg ;; esac
+    shift
+  done
+  [ -n "$slug" ] || slug=$(determine_slug); sync_theme "$slug" "$dry_run" "$no_activate"
+}
+
+main "$@"

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Omarchy passes the new theme slug as $1. Resolve the symlink so this hook
+# remains tied to the checked-out project after install.sh creates its links.
+hook_path=$0
+if command -v readlink >/dev/null 2>&1; then
+  resolved=$(readlink -f -- "$hook_path" 2>/dev/null || true)
+else
+  resolved=$hook_path
+fi
+[ -n "${resolved:-}" ] || resolved=$hook_path
+project_root=$(CDPATH= cd -- "$(dirname -- "$resolved")/../.." && pwd)
+exec "$project_root/bin/omarchy-bb-theme-sync" sync "${1:-}"

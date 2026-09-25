@@ -5,6 +5,53 @@ plugin. When an Omarchy theme changes, it reads that theme's `colors.toml`,
 generates one stable BB custom palette named `omarchy-sync`, and activates it
 with `bb theme set`.
 
+[![Verify](https://github.com/mikhaiIy/omarchy-bb-theme-sync/actions/workflows/verify.yml/badge.svg)](https://github.com/mikhaiIy/omarchy-bb-theme-sync/actions/workflows/verify.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+`omarchy-bb-theme-sync` is intentionally small: it owns one stable palette,
+`omarchy-sync`, and never mutates BB's other themes. The integration is useful
+for anyone who wants a BB window to follow the active Omarchy desktop theme.
+
+## Architecture
+
+```text
+Omarchy theme change
+        ↓
+~/.config/omarchy/hooks/theme-set.d/omarchy-bb-theme-sync
+        ↓
+bin/omarchy-bb-theme-sync sync <theme-slug>
+        ↓
+read <user-theme>/colors.toml or <stock-theme>/colors.toml
+        ↓
+map colours → BB CSS variables
+        ↓
+write <bb-theme-dir>/omarchy-sync/theme.css atomically
+        ↓
+bb theme set omarchy-sync
+```
+
+The command supports a normal `bb` on `PATH`, a packaged BB installation, and
+the CLI exposed by a running BB AppImage. A dry run never writes to BB.
+
+## What the integration guarantees
+
+- Stock Omarchy files are read-only to this project.
+- The generated theme has one stable id, so old generated files do not accumulate.
+- The stylesheet is written to a temporary file and renamed into place.
+- Installation and removal only manage symlinks that point to this checkout.
+- Uninstall refuses to remove an unmarked theme or an active `omarchy-sync` theme.
+
+## Project layout
+
+```text
+bin/omarchy-bb-theme-sync                 Main CLI and theme generator
+hooks/theme-set.d/omarchy-bb-theme-sync   Omarchy change hook
+install.sh                                  Safe symlink installer
+uninstall.sh                                Scoped uninstaller
+tests/verify.sh                             Isolated end-to-end verification
+tests/fixtures/                             Portable colour fixture
+```
+
 ## Requirements
 
 - Bash, `awk`, `sed`, `tr`, `mktemp`, `mv`, `mkdir`, and other usual POSIX-ish
